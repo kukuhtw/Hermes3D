@@ -1,142 +1,102 @@
-const crypto = require("node:crypto");
+  </form>
+</main></body></html>`;
 
-
-const parseCookies = (header) => {
-  const raw = typeof header === "string" ? header : "";
-  if (!raw.trim()) return {};
-  const out = {};
-  for (const part of raw.split(";")) {
-    const idx = part.indexOf("=");
-    if (idx === -1) continue;
-    const key = part.slice(0, idx).trim();
-    const value = part.slice(idx + 1).trim();
-    if (!key) continue;
-    out[key] = value;
-  }
-  return out;
-};
-
-/** Constant-time string comparison to prevent timing attacks. */
-const safeCompare = (a, b) => {
-  if (typeof a !== "string" || typeof b !== "string") return false;
-  const bufA = Buffer.from(a, "utf8");
-  const bufB = Buffer.from(b, "utf8");
-  if (bufA.length !== bufB.length) {
-    // Compare against self to burn constant time, then return false
-    crypto.timingSafeEqual(bufA, bufA);
-    return false;
-  }
-  return crypto.timingSafeEqual(bufA, bufB);
-};
-
-/** Simple in-memory rate limiter for auth attempts. */
-const createRateLimiter = (maxAttempts = 10, windowMs = 60_000) => {
-  const attempts = new Map();
-  const cleanup = setInterval(() => {
-    const now = Date.now();
-    for (const [key, entry] of attempts) {
-      if (now - entry.start > windowMs) attempts.delete(key);
-    }
-  }, windowMs);
-  cleanup.unref();
-
-  return {
-    isLimited(ip) {
-      const entry = attempts.get(ip);
-      if (!entry) return false;
-      return entry.count >= maxAttempts;
-    },
-    recordFailure(ip) {
-      const now = Date.now();
-      const entry = attempts.get(ip);
-      if (!entry || now - entry.start > windowMs) {
-        attempts.set(ip, { count: 1, start: now });
-        return;
-      }
-      entry.count++;
-    },
-    reset(ip) {
-      attempts.delete(ip);
-    },
-  };
-};
-
-/**
- * Resolve client IP for rate limiting.
- * When TRUSTED_PROXY=1 is set, the first value of X-Forwarded-For is used.
- * Only set TRUSTED_PROXY=1 when this server sits behind a reverse proxy that
- * you control (nginx, Caddy, Vercel edge). Without it, X-Forwarded-For is
- * ignored to prevent spoofing by direct clients.
- */
-const resolveClientIp = (req) => {
-  if (process.env.TRUSTED_PROXY === "1") {
-    const forwarded = req.headers?.["x-forwarded-for"];
-    if (typeof forwarded === "string") {
-      const first = forwarded.split(",")[0]?.trim();
-      if (first) return first;
-    }
-  }
-  return req.socket?.remoteAddress || "unknown";
+const sendLoginPage = (res, statusCode = 200, hasError = false) => {
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+  const error = hasError ? '<p class="error">Token tidak cocok. Periksa token di Dokploy lalu coba lagi.</p>' : "";
+  res.end(LOGIN_HTML.replace("__ERROR__", error));
 };
 
 function createAccessGate(options) {
   const token = String(options?.token ?? "").trim();
   const cookieName = String(options?.cookieName ?? "studio_access").trim() || "studio_access";
-
   const enabled = Boolean(token);
   const rateLimiter = createRateLimiter(10, 60_000);
 
-  const getAuthState = (req) => {
-    if (!enabled) return { authorized: true, limited: false };
+  const isAuthorized = (req) => {
+    const cookies = parseCookies(req.headers?.cookie);
+    return safeCompare(cookies[cookieName] || "", token);
+  };
+
+  const handleLogin = (req, res) => {
     const ip = resolveClientIp(req);
-    const cookieHeader = req.headers?.cookie;
-    const cookies = parseCookies(cookieHeader);
-    const authorized = safeCompare(cookies[cookieName] || "", token);
-    if (authorized) {
-      rateLimiter.reset(ip);
-      return { authorized: true, limited: false };
-    }
     if (rateLimiter.isLimited(ip)) {
-      return { authorized: false, limited: true };
+      res.statusCode = 429;
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.setHeader("Retry-After", "60");
+      res.end("Too many failed login attempts. Wait a minute and retry.");
+      return;
     }
-    rateLimiter.recordFailure(ip);
-    return { authorized: false, limited: rateLimiter.isLimited(ip) };
+
+    let body = "";
+    let tooLarge = false;
+    req.on("data", (chunk) => {
+      body += chunk.toString("utf8");
+      if (body.length > 8192) {
+        tooLarge = true;
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (tooLarge) return;
+      const submitted = new URLSearchParams(body).get("token") || "";
+      if (!safeCompare(submitted, token)) {
+        rateLimiter.recordFailure(ip);
+        sendLoginPage(res, 401, true);
+        return;
+      }
+
+      rateLimiter.reset(ip);
+      const secure = req.socket?.encrypted || String(req.headers?.["x-forwarded-proto"] || "").split(",")[0].trim() === "https";
+      const cookie = `${cookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${secure ? "; Secure" : ""}`;
+      res.statusCode = 303;
+      res.setHeader("Set-Cookie", cookie);
+      res.setHeader("Location", "/");
+      res.setHeader("Cache-Control", "no-store");
+      res.end();
+    });
   };
 
   const handleHttp = (req, res) => {
     if (!enabled) return false;
-    const auth = getAuthState(req);
-    if (!auth.authorized) {
-      const statusCode = auth.limited ? 429 : 401;
-      if (String(req.url || "/").startsWith("/api/")) {
-        res.statusCode = statusCode;
-        res.setHeader("Content-Type", "application/json");
-        res.end(
-          JSON.stringify({
-            error: auth.limited
-              ? "Too many failed studio access attempts. Wait a minute and retry."
-              : "Studio access token required. Send the configured Studio access cookie and retry.",
-          })
-        );
+    const pathname = new URL(req.url || "/", "http://localhost").pathname;
+
+    if (pathname === "/studio-login" && req.method === "GET") {
+      if (isAuthorized(req)) {
+        res.statusCode = 303;
+        res.setHeader("Location", "/");
+        res.end();
       } else {
-        res.statusCode = statusCode;
-        res.setHeader("Content-Type", "text/plain");
-        res.end(
-          auth.limited
-            ? "Too many failed studio access attempts. Wait a minute and retry."
-            : "Studio access token required. Set the studio_access cookie to access this page."
-        );
+        sendLoginPage(res);
       }
       return true;
     }
-    return false;
+    if (pathname === "/studio-login" && req.method === "POST") {
+      handleLogin(req, res);
+      return true;
+    }
+
+    if (isAuthorized(req)) return false;
+    if (pathname.startsWith("/api/")) {
+      res.statusCode = 401;
+      res.setHeader("Content-Type", "application/json");
+      res.setHeader("Cache-Control", "no-store");
+      res.end(JSON.stringify({ error: "Studio access token required. Open /studio-login to sign in." }));
+      return true;
+    }
+
+    res.statusCode = 303;
+    res.setHeader("Location", "/studio-login");
+    res.setHeader("Cache-Control", "no-store");
+    res.end();
+    return true;
   };
 
-  const allowUpgrade = (req) => {
-    if (!enabled) return true;
-    return getAuthState(req).authorized;
-  };
-
+  const allowUpgrade = (req) => !enabled || isAuthorized(req);
   return { enabled, handleHttp, allowUpgrade };
 }
 
